@@ -241,7 +241,7 @@ static void put_into_vehicle( Character &c, item_drop_reason reason, const std::
             }
             items_did_not_fit_count += it.count();
             //~ %1$s is item name, %2$s is vehicle name, %3$s is vehicle part name
-            add_msg( _( "Unable to fit %1$s in the %2$s's %3$s." ), it.tname(), veh.name, part_name );
+            add_msg( m_mixed, _( "Unable to fit %1$s in the %2$s's %3$s." ), it.tname(), veh.name, part_name );
             // Retain item in inventory if overflow not too large/heavy or wield if possible otherwise drop on the ground
             if( c.can_pickVolume( it ) && c.can_pickWeight( it, !get_option<bool>( "DANGEROUS_PICKUPS" ) ) ) {
                 c.i_add( it );
@@ -1775,8 +1775,34 @@ static bool construction_activity( Character &you, const zone_data * /*zone*/,
     // Set the trap that has the examine function
     // Use up the components
     for( const std::vector<item_comp> &it : built_chosen.requirements->get_components() ) {
-        std::list<item> tmp = you.consume_items( it, 1, is_crafting_component );
-        used.splice( used.end(), tmp );
+        for( const item_comp &comp : it ) {
+            comp_selection<item_comp> sel;
+            sel.use_from = usage_from::both;
+            sel.comp = comp;
+            std::list<item> empty_consumed = you.consume_items( sel, 1, is_empty_crafting_component );
+
+            int left_to_consume = 0;
+
+            if( !empty_consumed.empty() && empty_consumed.front().count_by_charges() ) {
+                int consumed = 0;
+                for( item &itm : empty_consumed ) {
+                    consumed += itm.charges;
+                }
+                left_to_consume = comp.count - consumed;
+            } else if( empty_consumed.size() < static_cast<size_t>( comp.count ) ) {
+                left_to_consume = comp.count - empty_consumed.size();
+            }
+
+            if( left_to_consume > 0 ) {
+                comp_selection<item_comp> remainder = sel;
+                remainder.comp.count = 1;
+                std::list<item>used_consumed = you.consume_items( remainder,
+                                               left_to_consume, is_crafting_component );
+                empty_consumed.splice( empty_consumed.end(), used_consumed );
+            }
+
+            used.splice( used.end(), empty_consumed );
+        }
     }
     pc.components = used;
     // TODO: fix point types
@@ -3493,9 +3519,9 @@ int get_auto_consume_moves( Character &you, const bool food )
     }
 
     if( best_comestible ) {
-        int consume_moves = -Pickup::cost_to_move_item( you,
-                            *best_comestible ) * std::max( rl_dist( you.pos(),
-                                    here.getlocal( best_comestible.position() ) ), 1 );
+        //The moves it takes you to walk there and back.
+        int consume_moves = 2 * you.run_cost( 100, false ) * std::max( rl_dist( you.pos(),
+                            here.getlocal( best_comestible.position() ) ), 1 );
         consume_moves += to_moves<int>( you.get_consume_time( *best_comestible ) );
 
         you.consume( best_comestible );
