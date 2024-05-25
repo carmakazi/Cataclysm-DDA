@@ -46,7 +46,7 @@ item Item_spawn_data::create_single( const time_point &birthday ) const
     return create_single( birthday, rec );
 }
 
-void Item_spawn_data::check_consistency() const
+void Item_spawn_data::check_consistency( bool actually_spawn ) const
 {
     if( on_overflow != overflow_behaviour::none && !container_item ) {
         debugmsg( "item group %s specifies overflow behaviour but not container", context() );
@@ -54,9 +54,11 @@ void Item_spawn_data::check_consistency() const
     // Spawn ourselves with all possible items being definitely spawned, so as
     // to verify e.g. that if a container item was specified it can actually
     // contain what was wanted.
-    ItemList dummy_list;
-    dummy_list.reserve( 20 );
-    create( dummy_list, calendar::turn_zero, spawn_flags::maximized );
+    if( actually_spawn ) {
+        ItemList dummy_list;
+        dummy_list.reserve( 20 );
+        create( dummy_list, calendar::turn_zero, spawn_flags::maximized );
+    }
 }
 
 void Item_spawn_data::relic_generator::load( const JsonObject &jo )
@@ -187,32 +189,57 @@ item Single_item_creator::create_single( const time_point &birthday, RecursionLi
 item Single_item_creator::create_single_without_container( const time_point &birthday,
         RecursionList &rec ) const
 {
-    item tmp;
-    if( type == S_ITEM ) {
-        if( id == "corpse" ) {
-            tmp = item::make_corpse( mtype_id::NULL_ID(), birthday );
-        } else {
-            tmp = item( id, birthday );
-        }
-    } else if( type == S_ITEM_GROUP ) {
+    // Check direct return conditions first.
+    if( type == S_NONE ) {
+        return item( null_item_id, birthday );
+    }
+    Item_spawn_data *isd = nullptr;
+    if( type == S_ITEM_GROUP ) {
         item_group_id group_id( id );
         if( std::find( rec.begin(), rec.end(), group_id ) != rec.end() ) {
             debugmsg( "recursion in item spawn list %s", id.c_str() );
             return item( null_item_id, birthday );
         }
         rec.push_back( group_id );
-        Item_spawn_data *isd = item_controller->get_group( group_id );
+        isd = item_controller->get_group( group_id );
         if( isd == nullptr ) {
             debugmsg( "unknown item spawn list %s", id.c_str() );
             return item( null_item_id, birthday );
         }
-        tmp = isd->create_single( birthday, rec );
-        rec.erase( rec.end() - 1 );
-    } else if( type == S_NONE ) {
-        return item( null_item_id, birthday );
     }
+
+    item tmp = ( [&]() -> item {
+        if( isd )
+        {
+            on_out_of_scope scope{
+                [&]{
+                    rec.erase( rec.end() - 1 );
+                }} ;
+            return isd->create_single( birthday, rec );
+        } else
+        {
+            cata_assert( type == S_ITEM );
+            if( id == "corpse" ) {
+                return item::make_corpse( mtype_id::NULL_ID(), birthday );
+            } else {
+                return item( id, birthday );
+            }
+        }
+    } )();
+
     if( one_in( 3 ) && tmp.has_flag( flag_VARSIZE ) ) {
         tmp.set_flag( flag_FIT );
+    }
+    if( components_items ) {
+        for( itype_id component_id : *components_items ) {
+            if( !component_id.is_valid() ) {
+                debugmsg( "Invalid components item %s in %s (could not find matching itype id)",
+                          component_id.c_str(), context() );
+                continue;
+            }
+            item component = item( component_id, calendar::turn );
+            tmp.components.add( component );
+        }
     }
     if( modifier ) {
         modifier->modify( tmp, "modifier for " + context() );
@@ -362,7 +389,7 @@ void Single_item_creator::finalize( const itype_id &container_ex )
     }
 }
 
-void Single_item_creator::check_consistency() const
+void Single_item_creator::check_consistency( bool actually_spawn ) const
 {
     if( type == S_ITEM ) {
         if( !item::type_is_defined( itype_id( id ) ) ) {
@@ -380,7 +407,10 @@ void Single_item_creator::check_consistency() const
     if( modifier ) {
         modifier->check_consistency( context() );
     }
-    Item_spawn_data::check_consistency();
+    // If this is to create a group and there's no container to restrain it, no need to actually create it,
+    // since groups are processed separately.
+    Item_spawn_data::check_consistency( ( type == S_ITEM_GROUP &&
+                                          !container_item ) ? false : actually_spawn );
 }
 
 bool Single_item_creator::remove_item( const itype_id &itemid )
@@ -507,13 +537,14 @@ void Item_modifier::modify( item &new_item, const std::string &context ) const
 
     {
         // create container here from modifier or from default to get max charges later
-        item cont;
+        std::optional<item> cont;
         if( container != nullptr ) {
             cont = container->create_single( new_item.birthday() );
-        } else if( new_item.type->default_container.has_value() ) {
+        } else if( new_item.type->default_container.has_value() &&
+                   !new_item.type->default_container->is_null() ) {
             cont = item( *new_item.type->default_container, new_item.birthday() );
             if( new_item.type->default_container_variant.has_value() ) {
-                cont.set_itype_variant( *new_item.type->default_container_variant );
+                cont->set_itype_variant( *new_item.type->default_container_variant );
             }
         }
 
@@ -539,13 +570,14 @@ void Item_modifier::modify( item &new_item, const std::string &context ) const
             }
         }
 
-        if( max_capacity == -1 && !cont.is_null() && ( new_item.made_of( phase_id::LIQUID ) ||
-                ( !new_item.is_tool() && !new_item.is_gun() && !new_item.is_magazine() ) ) ) {
+        if( max_capacity == -1 && cont.has_value() && !cont->is_null() &&
+            ( new_item.made_of( phase_id::LIQUID ) ||
+              ( !new_item.is_tool() && !new_item.is_gun() && !new_item.is_magazine() ) ) ) {
             if( new_item.type->weight == 0_gram ) {
-                max_capacity = new_item.charges_per_volume( cont.get_total_capacity() );
+                max_capacity = new_item.charges_per_volume( cont->get_total_capacity() );
             } else {
-                max_capacity = std::min( new_item.charges_per_volume( cont.get_total_capacity() ),
-                                         new_item.charges_per_weight( cont.get_total_weight_capacity() ) );
+                max_capacity = std::min( new_item.charges_per_volume( cont->get_total_capacity() ),
+                                         new_item.charges_per_weight( cont->get_total_weight_capacity() ) );
             }
         }
 
@@ -570,7 +602,7 @@ void Item_modifier::modify( item &new_item, const std::string &context ) const
 
             ch = charges_min == charges_max ? charges_min : rng( charges_min,
                     charges_max );
-        } else if( !cont.is_null() && new_item.made_of( phase_id::LIQUID ) ) {
+        } else if( cont.has_value() && !cont->is_null() && new_item.made_of( phase_id::LIQUID ) ) {
             new_item.charges = std::max( 1, max_capacity );
         }
 
@@ -647,11 +679,11 @@ void Item_modifier::modify( item &new_item, const std::string &context ) const
             }
         }
 
-        if( !cont.is_null() ) {
-            const pocket_type pk_type = guess_pocket_for( cont, new_item );
-            cont.put_in( new_item, pk_type );
-            cont.add_automatic_whitelist();
-            new_item = std::move( cont );
+        if( cont.has_value() && !cont->is_null() ) {
+            const pocket_type pk_type = guess_pocket_for( *cont, new_item );
+            cont->put_in( new_item, pk_type );
+            cont->add_automatic_whitelist();
+            new_item = std::move( *cont );
             if( sealed ) {
                 new_item.seal();
             }
@@ -697,10 +729,10 @@ void Item_modifier::modify( item &new_item, const std::string &context ) const
 void Item_modifier::check_consistency( const std::string &context ) const
 {
     if( ammo != nullptr ) {
-        ammo->check_consistency();
+        ammo->check_consistency( true );
     }
     if( container != nullptr ) {
-        container->check_consistency();
+        container->check_consistency( true );
     }
     if( with_ammo < 0 || with_ammo > 100 ) {
         debugmsg( "in %s: Item modifier's ammo chance %d is out of range", context, with_ammo );
@@ -870,12 +902,16 @@ item Item_group::create_single( const time_point &birthday, RecursionList &rec )
     return item( null_item_id, birthday );
 }
 
-void Item_group::check_consistency() const
+void Item_group::check_consistency( bool actually_spawn ) const
 {
+    // if type is collection, then spawning itself automatically spawnes all entries,
+    // thus no need to spawn them individually.
     for( const auto &elem : items ) {
-        elem->check_consistency();
+        // Assuming every entry needs to be spawned.
+        elem->check_consistency( true );
     }
-    Item_spawn_data::check_consistency();
+    // If this group has no container, no need to spawn it as a whole as every entry has been spawned.
+    Item_spawn_data::check_consistency( container_item ? actually_spawn : false );
 }
 
 int Item_spawn_data::get_probability( bool skip_event_check ) const

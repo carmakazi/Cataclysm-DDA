@@ -14,7 +14,7 @@ from .parsers.construction_group import parse_construction_group
 from .parsers.damage_info_order import parse_damage_info_order
 from .parsers.damage_type import parse_damage_type
 from .parsers.dream import parse_dream
-from .parsers.effect_on_condition import parse_effect_on_condition
+from .parsers.effect import parse_effect_on_condition
 from .parsers.effect_type import parse_effect_type
 from .parsers.enchant import parse_enchant
 from .parsers.event_statistic import parse_event_statistic
@@ -104,6 +104,7 @@ parsers = {
     "anatomy": dummy_parser,
     "armor": parse_generic,
     "ascii_art": dummy_parser,
+    "attack_vector": dummy_parser,
     "battery": parse_generic,
     "behavior": dummy_parser,
     "bionic": parse_bionic,
